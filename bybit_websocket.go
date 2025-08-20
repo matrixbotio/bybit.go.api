@@ -220,6 +220,10 @@ func ping(b *WebSocket) {
 				fmt.Println("Failed to marshal ping message:", err)
 				continue
 			}
+			if b.conn == nil {
+				fmt.Println("Ping skipped: connection is nil")
+				return
+			}
 			if err := b.conn.WriteMessage(websocket.TextMessage, jsonPingMessage); err != nil {
 				fmt.Println("Failed to send ping:", err)
 				return
