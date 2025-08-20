@@ -1,6 +1,6 @@
 module github.com/bybit-exchange/bybit.go.api
 
-go 1.21
+go 1.23.0
 
 require (
 	github.com/bitly/go-simplejson v0.5.1
@@ -16,6 +16,6 @@ require (
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
-	golang.org/x/net v0.29.0 // indirect
+	golang.org/x/net v0.38.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
