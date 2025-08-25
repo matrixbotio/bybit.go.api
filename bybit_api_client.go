@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"github.com/matrixbotio/bybit.go.api/models"
 	"io"
 	"log"
 	"net/http"
@@ -15,6 +14,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/matrixbotio/bybit.go.api/models"
 
 	"github.com/bitly/go-simplejson"
 	jsoniter "github.com/json-iterator/go"

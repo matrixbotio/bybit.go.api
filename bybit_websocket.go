@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +21,15 @@ func (b *WebSocket) handleIncomingMessages() {
 		if err != nil {
 			fmt.Println("Error reading:", err)
 			b.isConnected = false
+			// stop ping for this connection only
+			if b.connCancel != nil {
+				b.connCancel()
+			}
+			// best-effort close to unblock any writers
+			if b.conn != nil {
+				_ = b.conn.Close()
+				b.conn = nil
+			}
 			return
 		}
 
@@ -27,6 +37,10 @@ func (b *WebSocket) handleIncomingMessages() {
 			err := b.onMessage(string(message))
 			if err != nil {
 				fmt.Println("Error handling message:", err)
+				// stop ping for this connection only
+				if b.connCancel != nil {
+					b.connCancel()
+				}
 				return
 			}
 		}
@@ -34,26 +48,23 @@ func (b *WebSocket) handleIncomingMessages() {
 }
 
 func (b *WebSocket) monitorConnection() {
-	ticker := time.NewTicker(time.Second * 5) // Check every 5 seconds
+	ticker := time.NewTicker(time.Second * 5)
 	defer ticker.Stop()
 
 	for {
-		<-ticker.C
-		if !b.isConnected && b.ctx.Err() == nil { // Check if disconnected and context not done
-			fmt.Println("Attempting to reconnect...")
-			con := b.Connect() // Example, adjust parameters as needed
-			if con == nil {
-				fmt.Println("Reconnection failed:")
-			} else {
-				b.isConnected = true
-				go b.handleIncomingMessages() // Restart message handling
-			}
-		}
-
 		select {
-		case <-b.ctx.Done():
-			return // Stop the routine if context is done
-		default:
+		case <-ticker.C:
+			if !b.isConnected {
+				fmt.Println("Attempting to reconnect...")
+				con := b.Connect()
+				if con == nil {
+					fmt.Println("Reconnection failed:")
+				} else {
+					fmt.Println("Reconnected.")
+				}
+			}
+		case <-b.lifecycleCtx.Done():
+			return
 		}
 	}
 }
@@ -70,9 +81,18 @@ type WebSocket struct {
 	maxAliveTime string
 	pingInterval int
 	onMessage    MessageHandler
-	ctx          context.Context
-	cancel       context.CancelFunc
-	isConnected  bool
+	// ctx/cancel now split into lifecycle and per-connection contexts:
+	// ctx          context.Context
+	// cancel       context.CancelFunc
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+	connCtx         context.Context
+	connCancel      context.CancelFunc
+	isConnected     bool
+
+	// serialize all writes to the websocket
+	writeMu     sync.Mutex
+	monitorOnce sync.Once
 }
 
 type WebsocketOption func(*WebSocket)
@@ -119,6 +139,19 @@ func NewBybitPublicWebSocket(url string, handler MessageHandler) *WebSocket {
 
 func (b *WebSocket) Connect() *WebSocket {
 	var err error
+
+	// ensure lifecycle context exists (cancelled only by Disconnect)
+	if b.lifecycleCtx == nil || b.lifecycleCtx.Err() != nil {
+		b.lifecycleCtx, b.lifecycleCancel = context.WithCancel(context.Background())
+	}
+
+	// cancel previous per-connection context (stops old ping)
+	if b.connCancel != nil {
+		b.connCancel()
+	}
+	// new per-connection context
+	b.connCtx, b.connCancel = context.WithCancel(b.lifecycleCtx)
+
 	wssUrl := b.url
 	if b.maxAliveTime != "" {
 		wssUrl += "?max_alive_time=" + b.maxAliveTime
@@ -129,18 +162,24 @@ func (b *WebSocket) Connect() *WebSocket {
 		return nil
 	}
 
+	// Mark as connected so send() can write auth
+	b.isConnected = true
+
 	if b.requiresAuthentication() {
 		if err = b.sendAuth(); err != nil {
 			fmt.Println("Failed Connection:", fmt.Sprintf("%v", err))
+			// revert connection state on auth failure
+			b.isConnected = false
+			_ = b.conn.Close()
+			b.conn = nil
 			return nil
 		}
 	}
-	b.isConnected = true
 
+	// start goroutines
 	go b.handleIncomingMessages()
-	go b.monitorConnection()
-
-	b.ctx, b.cancel = context.WithCancel(context.Background())
+	// start reconnection monitor only once for lifecycle
+	b.monitorOnce.Do(func() { go b.monitorConnection() })
 	go ping(b)
 
 	return b
@@ -210,6 +249,10 @@ func ping(b *WebSocket) {
 	for {
 		select {
 		case <-ticker.C:
+			// skip if not connected
+			if b.conn == nil || !b.isConnected {
+				return
+			}
 			currentTime := time.Now().Unix()
 			pingMessage := map[string]string{
 				"op":     "ping",
@@ -220,27 +263,53 @@ func ping(b *WebSocket) {
 				fmt.Println("Failed to marshal ping message:", err)
 				continue
 			}
-			if b.conn == nil {
-				fmt.Println("Ping skipped: connection is nil")
-				return
+
+			// serialize writes and set a write deadline
+			b.writeMu.Lock()
+			if b.conn != nil {
+				_ = b.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			}
-			if err := b.conn.WriteMessage(websocket.TextMessage, jsonPingMessage); err != nil {
+			err = func() error {
+				if b.conn == nil || !b.isConnected {
+					return fmt.Errorf("connection not available for ping")
+				}
+				return b.conn.WriteMessage(websocket.TextMessage, jsonPingMessage)
+			}()
+			b.writeMu.Unlock()
+
+			if err != nil {
 				fmt.Println("Failed to send ping:", err)
+				// exit to allow reconnection logic to recreate ping
 				return
 			}
 			fmt.Println("Ping sent with UTC time:", currentTime)
 
-		case <-b.ctx.Done():
-			fmt.Println("Ping context closed, stopping ping.")
+		case <-b.connCtx.Done():
+			fmt.Println("Ping connection context closed, stopping ping.")
 			return
 		}
 	}
 }
 
 func (b *WebSocket) Disconnect() error {
-	b.cancel()
+	// stop lifecycle (monitor + future reconnects)
+	if b.lifecycleCancel != nil {
+		b.lifecycleCancel()
+	}
+	// stop current connection goroutines (ping)
+	if b.connCancel != nil {
+		b.connCancel()
+	}
 	b.isConnected = false
-	return b.conn.Close()
+	// serialize close vs. concurrent writers
+	b.writeMu.Lock()
+	defer b.writeMu.Unlock()
+	if b.conn != nil {
+		err := b.conn.Close()
+		b.conn = nil
+		return err
+	}
+	return nil
 }
 
 func (b *WebSocket) requiresAuthentication() bool {
@@ -285,5 +354,13 @@ func (b *WebSocket) sendAsJson(v interface{}) error {
 }
 
 func (b *WebSocket) send(message string) error {
+	// serialize all writes and set a write deadline
+	b.writeMu.Lock()
+	defer b.writeMu.Unlock()
+
+	if b.conn == nil || !b.isConnected {
+		return fmt.Errorf("websocket not connected")
+	}
+	_ = b.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	return b.conn.WriteMessage(websocket.TextMessage, []byte(message))
 }
