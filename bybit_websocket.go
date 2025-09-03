@@ -282,7 +282,7 @@ func ping(b *WebSocket) {
 				// exit to allow reconnection logic to recreate ping
 				return
 			}
-			fmt.Println("Ping sent with UTC time:", currentTime)
+			//fmt.Println("Ping sent with UTC time:", currentTime)
 
 		case <-b.connCtx.Done():
 			fmt.Println("Ping connection context closed, stopping ping.")
