@@ -16,8 +16,31 @@ import (
 type MessageHandler func(message string) error
 
 func (b *WebSocket) handleIncomingMessages() {
+	// recover from any panic to avoid crashing the application
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("panic recovered in handleIncomingMessages:", r)
+			// ensure connection context is cancelled so monitor/ping stop properly
+			if b.connCancel != nil {
+				b.connCancel()
+			}
+		}
+	}()
+
 	for {
-		_, message, err := b.conn.ReadMessage()
+		// Wait for the connection to be established
+		if b.conn == nil {
+			select {
+			case <-b.connCtx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
+		}
+
+		// Make a snapshot of the current connection to avoid races when resetting b.conn
+		conn := b.conn
+		_, message, err := conn.ReadMessage()
 		if err != nil {
 			fmt.Println("Error reading:", err)
 			b.isConnected = false
